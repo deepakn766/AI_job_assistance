@@ -3,16 +3,24 @@ agents/resume_optimizer_agent.py
 ---------------------------------
 AGENT 4: ATS Resume Optimization Agent
 
-Responsibilities:
-  1. Take the candidate's original resume + selected job description
-  2. Use Groq to rewrite/optimize sections for ATS alignment
-  3. Improve keywords, bullet points, summary
-  4. NEVER fabricate experience or skills
-  5. Output as text and save as DOCX
-
-ATS = Applicant Tracking System
-  Many companies use ATS software to scan resumes before a human reads them.
-  Key factors: keyword matching, clean formatting, clear section headers.
+FIXED VERSION — changes from original:
+  1. Upgraded model llama3-8b-8192 -> llama-3.3-70b-versatile. The 8B
+     model is weak at following the "never fabricate, rewrite everything
+     faithfully" instruction set and tends to drop sections under
+     pressure to stay concise — switching to the same 70B model used
+     for parsing makes output quality consistent and far more reliable
+     for a full-resume rewrite.
+  2. max_tokens raised 1800 -> 3000, and response_format=json_object
+     added, for the same truncation/parsing reasons as the resume agent.
+  3. experience_str / projects_str / education_str no longer silently
+     slice to short previews — full lists are passed in (still capped
+     generously) so nothing is dropped before it even reaches the model.
+  4. Added an explicit guard: if profile has NO experience/projects at
+     all, the prompt tells Groq this clearly instead of just leaving it
+     blank, AND the function prints a warning so you know to look
+     upstream (in the Resume Agent / parsing step) rather than assuming
+     this agent ate your data.
+  5. Raw response is logged on JSON failure, same as the resume agent.
 """
 
 import os
@@ -58,16 +66,32 @@ def optimize_resume(profile: dict, job: dict) -> dict:
     """
     client = get_groq_client()
 
-    # Prepare compact versions to fit in context window
-    skills_str = ", ".join(profile.get("skills", [])[:30])
-    experience_str = "\n".join([f"- {exp}" for exp in profile.get("experience", [])[:5]])
-    projects_str = "\n".join([f"- {proj}" for proj in profile.get("projects", [])[:4]])
-    education_str = "\n".join([f"- {edu}" for edu in profile.get("education", [])[:3]])
+    skills_list = profile.get("skills", [])
+    experience_list = profile.get("experience", [])
+    projects_list = profile.get("projects", [])
+    education_list = profile.get("education", [])
+
+    # FIX: surface this immediately instead of silently generating a
+    # thin resume. If you see this warning, the problem is upstream in
+    # resume_agent.py / analyze_resume(), not in this file.
+    if not experience_list and not projects_list:
+        print("[Optimizer Agent] WARNING: profile has NO experience and NO projects. "
+              "The optimized resume will only contain summary/skills/education. "
+              "Check that analyze_resume() actually extracted these sections "
+              "from the original resume text.")
+
+    skills_str = ", ".join(skills_list[:30])
+    experience_str = "\n".join([f"- {exp}" for exp in experience_list[:10]])  # FIX: 5 -> 10
+    projects_str = "\n".join([f"- {proj}" for proj in projects_list[:8]])      # FIX: 4 -> 8
+    education_str = "\n".join([f"- {edu}" for edu in education_list[:5]])      # FIX: 3 -> 5
 
     prompt = f"""
 You are an expert ATS resume writer and career coach.
 
-Your task: Optimize this candidate's resume for the specific job below.
+Your task: Optimize this candidate's ENTIRE resume for the specific job below.
+You must produce a COMPLETE resume — summary, skills, experience, projects,
+and education — not just a subset. Do not drop any section that has content
+in the candidate profile below.
 
 STRICT RULES (NEVER BREAK THESE):
 1. Do NOT invent, fabricate, or add fake experience, skills, or projects.
@@ -75,19 +99,23 @@ STRICT RULES (NEVER BREAK THESE):
 3. Use strong action verbs (Developed, Built, Optimized, Implemented, etc.)
 4. Mirror keywords from the job description naturally.
 5. Keep bullet points concise: max 2 lines each.
+6. Rewrite EVERY experience entry and EVERY project listed below — do not
+   skip any of them, and do not collapse multiple entries into one.
+7. If a section below is genuinely empty, leave the corresponding output
+   array empty — do not invent content to fill it.
 
 CANDIDATE PROFILE:
 Name: {profile.get('name', '')}
 Current Skills: {skills_str}
 
-Experience:
-{experience_str}
+Experience ({len(experience_list)} entries — rewrite ALL of them):
+{experience_str if experience_str else "(none provided)"}
 
-Projects:
-{projects_str}
+Projects ({len(projects_list)} entries — rewrite ALL of them):
+{projects_str if projects_str else "(none provided)"}
 
 Education:
-{education_str}
+{education_str if education_str else "(none provided)"}
 
 TARGET JOB:
 Title: {job.get('title', '')}
@@ -99,33 +127,48 @@ OUTPUT: Return ONLY a valid JSON object with these keys:
 {{
   "summary": "3-4 sentence ATS-optimized professional summary tailored to this role",
   "skills_section": ["skill1", "skill2", ...],
-  "experience_bullets": ["• Improved bullet 1", "• Improved bullet 2", ...],
-  "projects_bullets": ["• Project bullet 1", "• Project bullet 2", ...],
+  "experience_bullets": ["Improved bullet 1", "Improved bullet 2", ...],
+  "projects_bullets": ["Project bullet 1", "Project bullet 2", ...],
   "keywords_added": ["keyword1", "keyword2", ...]
 }}
 
+The experience_bullets and projects_bullets arrays must collectively cover
+EVERY entry from the candidate profile above — do not output fewer bullets
+than there are entries unless an entry genuinely had nothing to rewrite.
 No markdown, no extra text. Valid JSON only.
 """
 
+    optimized = None
     try:
         response = client.chat.completions.create(
-            model="llama3-8b-8192",
+            # FIX: upgraded from llama3-8b-8192. The 8B model was prone to
+            # truncating/dropping sections on long, multi-section rewrites.
+            model="llama-3.3-70b-versatile",
             messages=[{"role": "user", "content": prompt}],
             temperature=0.3,
-            max_tokens=1800
+            max_tokens=3000,  # FIX: was 1800 — too low for a full resume rewrite
+            response_format={"type": "json_object"},  # FIX: forces valid JSON
         )
         text = response.choices[0].message.content.strip()
         text = re.sub(r"```json|```", "", text).strip()
         optimized = json.loads(text)
 
-    except (json.JSONDecodeError, Exception) as e:
-        print(f"[Optimizer Agent] Groq failed: {e}. Using basic optimization.")
-        # Fallback: Return lightly formatted original data
+    except json.JSONDecodeError as e:
+        print(f"[Optimizer Agent] JSON parsing failed: {e}")
+        print(f"[Optimizer Agent] Raw response that failed to parse:\n{text[:2000]}")
+        optimized = None
+
+    except Exception as e:
+        print(f"[Optimizer Agent] Groq API call failed: {e}")
+        optimized = None
+
+    if optimized is None:
+        print("[Optimizer Agent] Using fallback (lightly formatted original data, no AI rewrite).")
         optimized = {
             "summary": profile.get("summary", "Experienced professional seeking new opportunities."),
-            "skills_section": profile.get("skills", [])[:20],
-            "experience_bullets": [f"• {exp}" for exp in profile.get("experience", [])],
-            "projects_bullets": [f"• {proj}" for proj in profile.get("projects", [])],
+            "skills_section": skills_list[:20],
+            "experience_bullets": [f"{exp}" for exp in experience_list],
+            "projects_bullets": [f"{proj}" for proj in projects_list],
             "keywords_added": []
         }
 
@@ -133,7 +176,23 @@ No markdown, no extra text. Valid JSON only.
     optimized["candidate_name"] = profile.get("name", "Candidate")
     optimized["candidate_email"] = profile.get("email", "")
     optimized["target_job"] = f"{job.get('title', '')} at {job.get('company', '')}"
-    optimized["education"] = profile.get("education", [])
+    optimized["education"] = education_list
+
+    # FIX: final safety net — if the AI rewrite somehow returned fewer
+    # experience/project bullets than the candidate actually has, fall
+    # back to the original (un-optimized but COMPLETE) entries for the
+    # missing ones rather than silently truncating the resume.
+    if experience_list and len(optimized.get("experience_bullets", [])) < len(experience_list):
+        print(f"[Optimizer Agent] WARNING: model returned "
+              f"{len(optimized.get('experience_bullets', []))} experience bullets but profile has "
+              f"{len(experience_list)} entries. Falling back to original experience text to avoid data loss.")
+        optimized["experience_bullets"] = [f"{exp}" for exp in experience_list]
+
+    if projects_list and len(optimized.get("projects_bullets", [])) < len(projects_list):
+        print(f"[Optimizer Agent] WARNING: model returned "
+              f"{len(optimized.get('projects_bullets', []))} project bullets but profile has "
+              f"{len(projects_list)} entries. Falling back to original project text to avoid data loss.")
+        optimized["projects_bullets"] = [f"{proj}" for proj in projects_list]
 
     # Save DOCX
     docx_path = save_as_docx(optimized, profile, job)
@@ -171,7 +230,6 @@ def save_as_docx(optimized: dict, profile: dict, job: dict) -> str:
         run.bold = True
         run.font.size = Pt(14 if level == 1 else 11)
         if level == 2:
-            # Section header with underline effect via border
             run.font.color.rgb = RGBColor(0x1a, 0x56, 0xdb)  # Professional blue
         para.space_after = Pt(4)
         return para
@@ -181,6 +239,15 @@ def save_as_docx(optimized: dict, profile: dict, job: dict) -> str:
         run = para.add_run(text)
         run.font.size = Pt(10)
         run.bold = bold
+        para.space_after = Pt(2)
+        return para
+
+    def add_bullet(text):
+        # FIX: use Word's actual bullet list style instead of relying on
+        # the LLM to prepend a "•" character (which it sometimes drops).
+        para = doc.add_paragraph(style="List Bullet")
+        run = para.add_run(text)
+        run.font.size = Pt(10)
         para.space_after = Pt(2)
         return para
 
@@ -210,21 +277,21 @@ def save_as_docx(optimized: dict, profile: dict, job: dict) -> str:
     add_heading("TECHNICAL SKILLS", level=2)
     skills = optimized.get("skills_section", [])
     if skills:
-        add_body("  •  ".join(skills[:20]))
+        add_body("  •  ".join(skills[:25]))  # FIX: 20 -> 25
     doc.add_paragraph()
 
     # --- Experience ---
     if optimized.get("experience_bullets"):
         add_heading("EXPERIENCE", level=2)
-        for bullet in optimized["experience_bullets"]:
-            add_body(bullet)
+        for bullet_text in optimized["experience_bullets"]:
+            add_bullet(bullet_text.lstrip("•- ").strip())
         doc.add_paragraph()
 
     # --- Projects ---
     if optimized.get("projects_bullets"):
         add_heading("PROJECTS", level=2)
-        for bullet in optimized["projects_bullets"]:
-            add_body(bullet)
+        for bullet_text in optimized["projects_bullets"]:
+            add_bullet(bullet_text.lstrip("•- ").strip())
         doc.add_paragraph()
 
     # --- Education ---

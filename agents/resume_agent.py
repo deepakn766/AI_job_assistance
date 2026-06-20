@@ -2,6 +2,24 @@
 Resume Analysis Agent
 ---------------------
 Parses raw resume text into structured JSON using Groq LLaMA3.
+
+FIXED VERSION — changes from original:
+  1. max_tokens raised 1500 -> 3000 (long resumes were getting truncated
+     mid-JSON, which threw a JSONDecodeError and silently triggered the
+     empty fallback profile -- this is the most likely cause of
+     "only name + skills" showing up downstream).
+  2. raw_text truncation raised 4000 -> 8000 chars so more of the resume
+     (especially experience/projects, which usually come after the
+     summary) actually reaches the model.
+  3. On any failure, the raw Groq response is now printed BEFORE the
+     fallback fires, so you can see exactly what went wrong instead of
+     just "Groq parsing failed".
+  4. After a "successful" parse, we sanity-check that experience/projects
+     aren't suspiciously empty and warn loudly if so -- this catches the
+     case where Groq returns valid JSON but with thin/empty sections.
+  5. response_format={"type": "json_object"} added -- this tells Groq to
+     guarantee valid JSON output, which eliminates most JSONDecodeError
+     failures outright (this is the single biggest fix).
 """
 
 import os
@@ -74,6 +92,12 @@ def detect_domain(skills: list[str]) -> dict:
 # ─── Main Analysis ────────────────────────────────────────────────────────────
 def analyze_resume(raw_text: str) -> dict:
     client = get_groq_client()
+
+    # FIX: 4000 -> 8000 chars. Experience/projects sections usually come
+    # after the summary/skills, so a short truncation was cutting them
+    # off before the model ever saw them.
+    resume_excerpt = raw_text[:8000]
+
     prompt = f"""
 You are an expert resume parser. Extract structured information from this resume text.
 
@@ -83,27 +107,48 @@ Return ONLY a valid JSON object with these exact keys:
   "email": "email address",
   "phone": "phone number or empty string",
   "skills": ["list", "of", "technical", "skills"],
-  "experience": ["Brief description of each job/role"],
+  "experience": ["Detailed description of each job/role, including company, title, duration, and 2-3 key responsibilities/achievements per role"],
   "education": ["Degree, Institution, Year"],
-  "projects": ["Project name and brief description"],
+  "projects": ["Project name and detailed description including technologies used"],
   "summary": "2-3 sentence professional summary"
 }}
 
+IMPORTANT:
+- Extract EVERY job/role found in the resume, not just the most recent one.
+- Extract EVERY project found in the resume.
+- Do not omit or summarize away the experience/projects sections — list each one as a separate array entry.
+- If a section genuinely does not exist in the resume, return an empty array for it, but do not guess it's empty just because it's far down the page.
+
 RESUME TEXT:
-{raw_text[:4000]}
+{resume_excerpt}
 """
+    profile = None
     try:
         response = client.chat.completions.create(
-            model="llama-3.3-70b-versatile",   # ✅ updated model
+            model="llama-3.3-70b-versatile",
             messages=[{"role": "user", "content": prompt}],
             temperature=0.1,
-            max_tokens=1500
+            max_tokens=3000,  # FIX: was 1500 — too low for full resumes, caused mid-JSON truncation
+            response_format={"type": "json_object"},  # FIX: forces valid JSON, eliminates most parse failures
         )
         response_text = response.choices[0].message.content.strip()
         response_text = re.sub(r"```json|```", "", response_text).strip()
         profile = json.loads(response_text)
+
+    except json.JSONDecodeError as e:
+        # FIX: log the actual raw text that failed to parse, so the real
+        # problem (truncation, malformed JSON, etc.) is visible instead
+        # of silently vanishing into the fallback.
+        print(f"[Resume Agent] JSON parsing failed: {e}")
+        print(f"[Resume Agent] Raw response that failed to parse:\n{response_text[:2000]}")
+        profile = None
+
     except Exception as e:
-        print(f"[Resume Agent] Groq parsing failed: {e}. Using fallback.")
+        print(f"[Resume Agent] Groq API call failed: {e}")
+        profile = None
+
+    if profile is None:
+        print("[Resume Agent] Using fallback profile (name/email/skills only via regex+keywords).")
         profile = {
             "name": extract_name_heuristic(raw_text),
             "email": extract_email(raw_text),
@@ -130,5 +175,14 @@ RESUME TEXT:
     profile["domain_alternatives"] = domain_info["alternatives"]
     profile["domain_confidence"] = domain_info["confidence"]
     profile["raw_text"] = raw_text
+
+    # FIX: sanity check — warn loudly if experience/projects came back
+    # empty even though parsing "succeeded". This is the symptom you're
+    # seeing (name + skills only) and now it will at least be visible
+    # in your terminal/logs instead of failing silently.
+    if not profile.get("experience") and not profile.get("projects"):
+        print("[Resume Agent] WARNING: experience and projects are both empty after parsing. "
+              "Check that your resume text actually contains these sections, and check the "
+              "raw Groq response above if this is unexpected.")
 
     return profile
